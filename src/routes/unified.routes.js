@@ -32,7 +32,7 @@ import {
   anilistCharacters, anilistRecommendations, anilistSeason,
 } from "../core/anilist.js";
 import { getLane } from "../core/registry.js";
-import { runStreamingChain } from "../core/chain.js";
+import { runStreamingChain, malEpisodeIndex } from "../core/chain.js";
 import { resolveKeyToAnilist, matchSlug, canonicalFor, keyFor } from "../core/keys.js";
 import { CustomError } from "../core/errors.js";
 import { withCache } from "../core/cache.js";
@@ -221,16 +221,16 @@ router.get("/anime", wrap(async (req, res) => {
  * The kaze listing lane returns episode numbers + ids, but only placeholder
  * titles ("Episode 1", "Episode 2", ...). To surface the actual episode
  * NAME (e.g. "The Journey's End", "It Didn't Have to Be Magic…"), we
- * additionally fetch MAL's episode list via the ishi lane's MAL scraper
- * (which parses myanimelist.net's /anime/{malId}/_/episode pages) and
- * merge `title`, `titleJapanese`, `aired`, `filler`, `recap` by episode
- * number. MAL has the most complete crowd-sourced episode-title database,
- * so it's the canonical source for episode names.
+ * additionally merge MAL's crowd-sourced episode list (via the shared
+ * malEpisodeIndex helper in core/chain.js — the SAME index and cache entry
+ * /api/chain uses, so an anime's titles are scraped at most once per cache
+ * window regardless of which endpoint asks first). Merged fields:
+ * `title`, `titleJapanese`, `aired`, `filler`, `recap`.
  *
  * Fallback chain:
  *   1. kaze listing  -> episode numbers + ids + placeholder titles
  *   2. ishi channels -> episode numbers + ids (different slugs)
- *   3. MAL scraper   -> real per-episode titles, airdate, filler flag
+ *   3. MAL index     -> real per-episode titles, airdate, filler flag
  *   4. If both listing lanes fail but MAL has the episode list, return
  *      the MAL list directly (no playback id, but the client at least
  *      gets the titles).
@@ -277,37 +277,15 @@ router.get("/anime/episodes", wrap(async (req, res) => {
       }
     }
 
-    // ---- 3. enrich with MAL per-episode titles ---------------------------
-    // The kaze/ishi listing lanes only return placeholder titles like
-    // "Episode 1". MAL has the real, crowd-sourced episode names — fetch
-    // them and merge by episode number. This is best-effort: if MAL is
-    // unreachable or has no entry, we keep the placeholder titles.
-    const malId = canonical?.malId ?? null;
-    let malMap = null;
-    if (malId) {
-      try {
-        const ishi = getLane("ishi");
-        if (typeof ishi.malAllEpisodes === "function") {
-          const malList = await ishi.malAllEpisodes(parseInt(malId, 10));
-          if (Array.isArray(malList) && malList.length) {
-            malMap = new Map();
-            for (const m of malList) {
-              if (m && Number.isFinite(Number(m.malId))) {
-                malMap.set(Number(m.malId), m);
-              }
-            }
-          }
-        }
-      } catch (err) {
-        console.error(`[APIKUOSHI][episodes] MAL enrich failed for malId=${malId}:`, err.message);
-      }
-    }
+    // ---- 3. MAL per-episode index (shared with /chain) -------------------
+    const malIdx = await malEpisodeIndex(canonical?.malId ?? null);
+    const hasMal = malIdx && Object.keys(malIdx).length > 0;
 
     // ---- 4. merge ---------------------------------------------------------
     if (primary && primary.length) {
-      if (malMap) {
+      if (hasMal) {
         return primary.map((ep) => {
-          const mal = malMap.get(ep.number) || null;
+          const mal = malIdx[ep.number] || null;
           return {
             ...ep,
             title: mal?.title || ep.title || null,
@@ -323,8 +301,8 @@ router.get("/anime/episodes", wrap(async (req, res) => {
 
     // ---- 5. fallback: MAL-only list --------------------------------------
     // No kaze/ishi listing worked, but MAL has episode titles — return them.
-    if (malMap && malMap.size) {
-      return Array.from(malMap.values())
+    if (hasMal) {
+      return Object.values(malIdx)
         .sort((a, b) => Number(a.malId) - Number(b.malId))
         .map((m) => ({
           number: Number(m.malId),
@@ -489,10 +467,12 @@ router.get("/download", wrap(async (req, res) => {
 /**
  * GET /api/chain?q=... | key=... | id=... | slug=... [&ep=1] [&type=sub] [&probe=0] [&all=1]
  * THE STREAMING CHAIN — one call, whole journey, nested functions:
- *   resolve -> info -> episodes -> servers -> streams -> probe
+ *   resolve -> info -> episodes -> servers -> streams -> probe -> episode-titles
  * Every hop is timed and reported in steps[]. Every stream URL is probed
  * against the real CDN and the response ends with a ready-to-play `best`
- * stream (proxied through the built-in CORS proxies).
+ * stream (proxied through the built-in CORS proxies). The response also
+ * carries the requested episode's REAL title (MAL-backed, same source as
+ * /api/anime/episodes): see `episode` and top-level `episodeTitle`.
  */
 router.get("/chain", wrap(async (req, res) => {
   const q = req.query.q || null;
