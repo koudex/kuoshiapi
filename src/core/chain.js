@@ -16,6 +16,11 @@
  *  requirement), and the response ends with a ready-to-play `best`
  *  stream.
  *
+ *  The requested episode's REAL name (MAL crowd-sourced — the same
+ *  source that backs /api/anime/episodes) is merged into `episode`
+ *  and echoed as `episodeTitle`, e.g. "The Journey's End", with
+ *  titleJapanese / aired / filler / recap.
+ *
  *  Input (any ONE of):
  *    q=dandadan            search -> best match
  *    key=anilist:154587    any anime key format
@@ -77,6 +82,43 @@ function proxiedUrl(url, referer = null) {
   const ref = referer ? `&ref=${encodeURIComponent(referer)}` : "";
   const enc = encodeURIComponent(url);
   return isHlsUrl(url) ? `/api/proxy/hls?url=${enc}${ref}` : `/api/proxy/video?url=${enc}${ref}`;
+}
+
+// ---------------------------------------------------------------------------
+// Episode names — MAL's crowd-sourced per-episode titles
+// ---------------------------------------------------------------------------
+
+/**
+ * MAL episode titles, indexed by episode number.
+ *
+ * The listing lanes only return placeholder titles ("Episode 1", ...).
+ * MAL has the real, crowd-sourced episode names — the same source that
+ * backs /api/anime/episodes — so both surfaces report the true name of
+ * any episode (e.g. "The Journey's End") plus its Japanese title,
+ * airdate, and filler/recap flags.
+ *
+ * Exported for the routes file — /api/anime/episodes merges the same
+ * index. Cached per malId under ONE shared key, so an anime's episode
+ * titles are scraped from MAL at most once per cache window, no matter
+ * which endpoint asks first. Never throws — failures yield {}.
+ */
+export async function malEpisodeIndex(malId) {
+  if (!malId) return {};
+  try {
+    return await withCache(`mal-episodes:${malId}:v1`, config.cacheSeconds, async () => {
+      const ishi = getLane("ishi");
+      if (typeof ishi.malAllEpisodes !== "function") return {};
+      const list = await ishi.malAllEpisodes(parseInt(malId, 10));
+      const index = {};
+      for (const m of Array.isArray(list) ? list : []) {
+        const n = Number(m?.malId);
+        if (Number.isFinite(n)) index[n] = m;
+      }
+      return index;
+    });
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -526,6 +568,14 @@ export async function runStreamingChain(input) {
     `${r.listingSlug ? ` · listing: ${r.listingSlug}` : " · listing not matched"}` +
     `${r.via ? ` · via ${r.via}` : ""}`;
 
+  // ---- episode names: start the MAL fetch NOW ------------------------------
+  // The canonical identity (and malId) is known, so kick off the MAL
+  // episode-title fetch immediately and let it overlap the info/episodes/
+  // servers/streams/probe hops. Warm cache: free. Cold: hidden inside the
+  // chain's other work — ~0 added latency by the time we need it.
+  const titlesStart = now();
+  const malTitlesPromise = malEpisodeIndex(r.canonical?.malId ?? null);
+
   // ---- 2. info ------------------------------------------------------------
   const infoStep = record(await timed("info", () => stepInfo(ctx)));
   if (infoStep.ok) {
@@ -612,6 +662,20 @@ export async function runStreamingChain(input) {
     if (best && !directExists) best = { ...best, kind: "embed", detail: "unverified embed page (?probe=0) — play in an <iframe>, not <video>" };
   }
 
+  // ---- 7. episode titles (MAL) -----------------------------------------------
+  // Fetch was kicked off right after resolve — awaiting here usually costs
+  // ~0ms because it already finished during the servers/streams/probe hops.
+  const malIdx = await malTitlesPromise;
+  const malTitleCount = Object.keys(malIdx).length;
+  steps.push({
+    step: "episode-titles",
+    ok: true,
+    ms: now() - titlesStart,
+    detail: malTitleCount
+      ? `${malTitleCount} MAL episode title(s) available`
+      : "no MAL episode titles for this anime",
+  });
+
   // ---- verdict --------------------------------------------------------------
   const directCount = (probeData?.tested || streamStep.data.streams || []).filter((s) => s.kind === "direct" || isHlsUrl(s.url) || /\.(mp4|mkv|webm)(\?|$)/i.test(s.url || "")).length;
   const verdict = !resolvedCount
@@ -628,6 +692,11 @@ export async function runStreamingChain(input) {
 
   const canonical = r.canonical;
   const listingInfo = ctx.info?.listingInfo || r.listingInfo || null;
+
+  // ---- episode identity: MAL real name > listing placeholder > null ---------
+  const episodeMeta = ctx.servers?.episodeMeta || null;
+  const malEp = malIdx?.[ep] || null;
+  const episodeTitle = malEp?.title || episodeMeta?.title || null;
 
   // ---- public streams -------------------------------------------------------
   const publicStreams = (probeData?.tested || []).map((s) => {
@@ -677,10 +746,15 @@ export async function runStreamingChain(input) {
     },
     episode: {
       requested: ep,
-      number: ctx.servers?.episodeMeta?.episode ?? ep,
-      title: ctx.servers?.episodeMeta?.title || null,
-      id: ctx.servers?.episodeMeta?.id || null,
+      number: episodeMeta?.episode ?? ep,
+      title: episodeTitle,
+      titleJapanese: malEp?.titleJapanese || null,
+      aired: malEp?.aired || null,
+      filler: malEp?.filler ?? false,
+      recap: malEp?.recap || false,
+      id: episodeMeta?.id || null,
     },
+    episodeTitle: episodeTitle || `Episode ${ep}`,
     servers: (ctx.servers?.servers || []).map((s) => ({ name: s.name, type: s.type ?? null })),
     streams: publicStreams,
     best,
@@ -699,6 +773,7 @@ export async function runStreamingChain(input) {
         `type=${type}`,
       ].filter(Boolean).join("&")}`,
       watchEndpoint: `/api/watch?key=${encodeURIComponent(keyFor(r.anilistId) || "")}&ep=${ep}`,
+      episodesEndpoint: `/api/anime/episodes?key=${encodeURIComponent(keyFor(r.anilistId) || "")}`,
       serversEndpoint: `/api/anime/servers?key=${encodeURIComponent(keyFor(r.anilistId) || "")}&ep=${ep}`,
       nextEpisode: `/api/chain?${[
         input.q ? `q=${encodeURIComponent(input.q)}` : input.key ? `key=${encodeURIComponent(input.key)}` : `slug=${encodeURIComponent(input.slug || "")}`,
